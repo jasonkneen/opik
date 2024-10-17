@@ -89,6 +89,7 @@ const CompareExperimentsDetails: React.FunctionComponent<
     return (
       <Button
         variant="outline"
+        size="sm"
         onClick={() => {
           setShowCompareFeedback(!showCompareFeedback);
         }}
@@ -195,13 +196,17 @@ const CompareExperimentsDetails: React.FunctionComponent<
 
   return (
     <div className="pb-4 pt-6">
-      <div className="mb-4 flex min-h-10 items-center justify-between">
-        <h1 className="comet-title-l">{title}</h1>
+      <div className="mb-4 flex min-h-8 items-center justify-between">
+        <h1 className="comet-title-l truncate break-words">{title}</h1>
         {renderCompareFeedbackScoresButton()}
       </div>
       <div className="mb-1 flex gap-4 overflow-x-auto">
         {!isCompare && (
-          <Tag size="lg" variant="gray" className="flex items-center gap-2">
+          <Tag
+            size="lg"
+            variant="gray"
+            className="flex shrink-0 items-center gap-2"
+          >
             <Clock className="size-4 shrink-0" />
             <div className="truncate">{formatDate(experiment?.created_at)}</div>
           </Tag>

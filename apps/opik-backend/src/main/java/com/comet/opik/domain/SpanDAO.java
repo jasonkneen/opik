@@ -8,8 +8,7 @@ import com.comet.opik.domain.filter.FilterStrategy;
 import com.comet.opik.utils.JsonUtils;
 import com.comet.opik.utils.TemplateUtils;
 import com.google.common.base.Preconditions;
-import com.newrelic.api.agent.Segment;
-import com.newrelic.api.agent.Trace;
+import io.opentelemetry.instrumentation.annotations.WithSpan;
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.Result;
@@ -39,6 +38,7 @@ import static com.comet.opik.domain.AsyncContextUtils.bindUserNameAndWorkspaceCo
 import static com.comet.opik.domain.AsyncContextUtils.bindWorkspaceIdToFlux;
 import static com.comet.opik.domain.AsyncContextUtils.bindWorkspaceIdToMono;
 import static com.comet.opik.domain.FeedbackScoreDAO.EntityType;
+import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.Segment;
 import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.endSegment;
 import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.startSegment;
 import static com.comet.opik.utils.AsyncUtils.makeFluxContextAware;
@@ -480,18 +480,29 @@ class SpanDAO {
             ;
             """;
 
+    public static final String SELECT_PROJECT_ID_FROM_SPANS = """
+            SELECT
+                  id,
+                  project_id
+            FROM spans
+            WHERE id IN :ids
+            AND workspace_id = :workspace_id
+            ORDER BY id DESC, last_updated_at DESC
+            LIMIT 1 BY id
+            """;
+
     private final @NonNull ConnectionFactory connectionFactory;
     private final @NonNull FeedbackScoreDAO feedbackScoreDAO;
     private final @NonNull FilterQueryBuilder filterQueryBuilder;
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> insert(@NonNull Span span) {
         return Mono.from(connectionFactory.create())
                 .flatMapMany(connection -> insert(span, connection))
                 .then();
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> batchInsert(@NonNull List<Span> spans) {
 
         Preconditions.checkArgument(!spans.isEmpty(), "Spans list must not be empty");
@@ -620,7 +631,7 @@ class SpanDAO {
         Segment segment = startSegment("spans", "Clickhouse", "insert");
 
         return makeFluxContextAware(bindUserNameAndWorkspaceContextToStream(statement))
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
     private ST newInsertTemplate(Span span) {
@@ -630,7 +641,7 @@ class SpanDAO {
         return template;
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> update(@NonNull UUID id, @NonNull SpanUpdate spanUpdate) {
         return Mono.from(connectionFactory.create())
                 .flatMapMany(connection -> update(id, spanUpdate, connection))
@@ -638,7 +649,7 @@ class SpanDAO {
                 .reduce(0L, Long::sum);
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> partialInsert(@NonNull UUID id, @NonNull UUID projectId, @NonNull SpanUpdate spanUpdate) {
         return Mono.from(connectionFactory.create())
                 .flatMapMany(connection -> {
@@ -661,7 +672,7 @@ class SpanDAO {
                     Segment segment = startSegment("spans", "Clickhouse", "partial_insert");
 
                     return makeFluxContextAware(bindUserNameAndWorkspaceContextToStream(statement))
-                            .doFinally(signalType -> segment.end());
+                            .doFinally(signalType -> endSegment(segment));
                 })
                 .flatMap(Result::getRowsUpdated)
                 .reduce(0L, Long::sum);
@@ -676,7 +687,7 @@ class SpanDAO {
         Segment segment = startSegment("spans", "Clickhouse", "update");
 
         return makeFluxContextAware(bindUserNameAndWorkspaceContextToStream(statement))
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
     private void bindUpdateParams(SpanUpdate spanUpdate, Statement statement) {
@@ -721,15 +732,13 @@ class SpanDAO {
         return template;
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Span> getById(@NonNull UUID id) {
         log.info("Getting span by id '{}'", id);
         return Mono.from(connectionFactory.create())
                 .flatMapMany(connection -> getById(id, connection))
                 .flatMap(this::mapToDto)
-                .flatMap(span -> Mono.from(connectionFactory.create())
-                        .flatMap(connection -> enhanceWithFeedbackScores(List.of(span), connection)
-                                .map(List::getFirst)))
+                .flatMap(span -> enhanceWithFeedbackScores(List.of(span)).map(List::getFirst))
                 .singleOrEmpty();
     }
 
@@ -740,15 +749,15 @@ class SpanDAO {
         Segment segment = startSegment("spans", "Clickhouse", "get_by_id");
 
         return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> deleteByTraceId(@NonNull UUID traceId, @NonNull Connection connection) {
         return deleteByTraceIds(Set.of(traceId), connection);
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> deleteByTraceIds(Set<UUID> traceIds, @NonNull Connection connection) {
         Preconditions.checkArgument(
                 CollectionUtils.isNotEmpty(traceIds), "Argument 'traceIds' must not be empty");
@@ -757,7 +766,7 @@ class SpanDAO {
                 .bind("trace_ids", traceIds);
         var segment = startSegment("spans", "Clickhouse", "delete_by_trace_id");
         return makeMonoContextAware(bindWorkspaceIdToMono(statement))
-                .doFinally(signalType -> segment.end())
+                .doFinally(signalType -> endSegment(segment))
                 .then();
     }
 
@@ -800,7 +809,7 @@ class SpanDAO {
         });
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Span.SpanPage> find(int page, int size, @NonNull SpanSearchCriteria spanSearchCriteria) {
         log.info("Finding span by '{}'", spanSearchCriteria);
         return countTotal(spanSearchCriteria).flatMap(total -> find(page, size, spanSearchCriteria, total));
@@ -811,21 +820,20 @@ class SpanDAO {
                 .flatMapMany(connection -> find(page, size, spanSearchCriteria, connection))
                 .flatMap(this::mapToDto)
                 .collectList()
-                .flatMap(spans -> Mono.from(connectionFactory.create())
-                        .flatMap(connection -> enhanceWithFeedbackScores(spans, connection)))
+                .flatMap(this::enhanceWithFeedbackScores)
                 .map(spans -> new Span.SpanPage(page, spans.size(), total, spans));
     }
 
-    private Mono<List<Span>> enhanceWithFeedbackScores(List<Span> spans, Connection connection) {
+    private Mono<List<Span>> enhanceWithFeedbackScores(List<Span> spans) {
         List<UUID> spanIds = spans.stream().map(Span::id).toList();
 
         Segment segment = startSegment("spans", "Clickhouse", "enhance_with_feedback_scores");
 
-        return feedbackScoreDAO.getScores(EntityType.SPAN, spanIds, connection)
+        return feedbackScoreDAO.getScores(EntityType.SPAN, spanIds)
                 .map(scoresMap -> spans.stream()
                         .map(span -> span.toBuilder().feedbackScores(scoresMap.get(span.id())).build())
                         .toList())
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
     private Publisher<? extends Result> find(int page, int size, SpanSearchCriteria spanSearchCriteria,
@@ -842,7 +850,7 @@ class SpanDAO {
         Segment segment = startSegment("spans", "Clickhouse", "find");
 
         return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
     private Mono<Long> countTotal(SpanSearchCriteria spanSearchCriteria) {
@@ -862,7 +870,7 @@ class SpanDAO {
         Segment segment = startSegment("spans", "Clickhouse", "count_total");
 
         return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
-                .doFinally(signalType -> segment.end());
+                .doFinally(signalType -> endSegment(segment));
     }
 
     private ST newFindTemplate(String query, SpanSearchCriteria spanSearchCriteria) {
@@ -893,7 +901,7 @@ class SpanDAO {
                 });
     }
 
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<List<WorkspaceAndResourceId>> getSpanWorkspace(@NonNull Set<UUID> spanIds) {
         if (spanIds.isEmpty()) {
             return Mono.just(List.of());
@@ -911,5 +919,26 @@ class SpanDAO {
                         row.get("workspace_id", String.class),
                         row.get("id", UUID.class))))
                 .collectList();
+    }
+
+    @WithSpan
+    public Mono<Map<UUID, UUID>> getProjectIdFromSpans(@NonNull Set<UUID> spanIds) {
+
+        if (spanIds.isEmpty()) {
+            return Mono.just(Map.of());
+        }
+
+        return Mono.from(connectionFactory.create())
+                .flatMapMany(connection -> {
+
+                    var statement = connection.createStatement(SELECT_PROJECT_ID_FROM_SPANS)
+                            .bind("ids", spanIds.toArray(UUID[]::new));
+
+                    return makeFluxContextAware(bindWorkspaceIdToFlux(statement));
+                })
+                .flatMap(result -> result.map((row, rowMetadata) -> Map.entry(
+                        row.get("id", UUID.class),
+                        row.get("project_id", UUID.class))))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
 }

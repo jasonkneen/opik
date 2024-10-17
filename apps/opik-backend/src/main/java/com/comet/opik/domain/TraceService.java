@@ -17,6 +17,7 @@ import com.comet.opik.utils.AsyncUtils;
 import com.comet.opik.utils.WorkspaceUtils;
 import com.google.common.base.Preconditions;
 import com.google.inject.ImplementedBy;
+import io.opentelemetry.instrumentation.annotations.WithSpan;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import jakarta.ws.rs.NotFoundException;
@@ -79,7 +80,7 @@ class TraceServiceImpl implements TraceService {
     private final @NonNull LockService lockService;
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<UUID> create(@NonNull Trace trace) {
 
         String projectName = WorkspaceUtils.getProjectName(trace.projectName());
@@ -93,7 +94,7 @@ class TraceServiceImpl implements TraceService {
                         Mono.defer(() -> insertTrace(trace, project, id))));
     }
 
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> create(TraceBatch batch) {
 
         Preconditions.checkArgument(!batch.traces().isEmpty(), "Batch traces cannot be empty");
@@ -211,7 +212,7 @@ class TraceServiceImpl implements TraceService {
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> update(@NonNull TraceUpdate traceUpdate, @NonNull UUID id) {
 
         var projectName = WorkspaceUtils.getProjectName(traceUpdate.projectName());
@@ -265,40 +266,38 @@ class TraceServiceImpl implements TraceService {
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Trace> get(@NonNull UUID id) {
         return template.nonTransaction(connection -> dao.findById(id, connection))
                 .switchIfEmpty(Mono.defer(() -> Mono.error(failWithNotFound("Trace not found"))));
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> delete(@NonNull UUID id) {
         log.info("Deleting trace by id '{}'", id);
         return lockService.executeWithLock(
                 new LockService.Lock(id, TRACE_KEY),
-                Mono.defer(() -> template
-                        .nonTransaction(
-                                connection -> feedbackScoreDAO.deleteByEntityId(EntityType.TRACE, id, connection))
+                Mono.defer(() -> feedbackScoreDAO.deleteByEntityId(EntityType.TRACE, id))
                         .then(Mono.defer(
                                 () -> template.nonTransaction(connection -> spanDAO.deleteByTraceId(id, connection))))
-                        .then(Mono.defer(() -> template.nonTransaction(connection -> dao.delete(id, connection))))));
+                        .then(Mono.defer(() -> template.nonTransaction(connection -> dao.delete(id, connection)))));
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Void> delete(Set<UUID> ids) {
         Preconditions.checkArgument(CollectionUtils.isNotEmpty(ids), "Argument 'ids' must not be empty");
         log.info("Deleting traces, count '{}'", ids.size());
         return template
-                .nonTransaction(connection -> feedbackScoreDAO.deleteByEntityIds(EntityType.TRACE, ids, connection))
+                .nonTransaction(connection -> feedbackScoreDAO.deleteByEntityIds(EntityType.TRACE, ids))
                 .then(Mono
                         .defer(() -> template.nonTransaction(connection -> spanDAO.deleteByTraceIds(ids, connection))))
                 .then(Mono.defer(() -> template.nonTransaction(connection -> dao.delete(ids, connection))));
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Trace.TracePage> find(int page, int size, @NonNull TraceSearchCriteria criteria) {
 
         if (criteria.projectId() != null) {
@@ -312,7 +311,7 @@ class TraceServiceImpl implements TraceService {
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<Boolean> validateTraceWorkspace(@NonNull String workspaceId, @NonNull Set<UUID> traceIds) {
         if (traceIds.isEmpty()) {
             return Mono.just(true);
@@ -324,7 +323,7 @@ class TraceServiceImpl implements TraceService {
     }
 
     @Override
-    @com.newrelic.api.agent.Trace(dispatcher = true)
+    @WithSpan
     public Mono<TraceCountResponse> countTracesPerWorkspace() {
         return template.stream(dao::countTracesPerWorkspace)
                 .collectList()

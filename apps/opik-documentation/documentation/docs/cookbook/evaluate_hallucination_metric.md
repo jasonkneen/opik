@@ -10,7 +10,7 @@ For this guide we will be evaluating the Hallucination metric included in the LL
 
 
 ```python
-%pip install opik pyarrow fsspec huggingface_hub --upgrade --quiet 
+%pip install opik pyarrow fsspec huggingface_hub --upgrade
 ```
 
 
@@ -35,6 +35,8 @@ if "OPENAI_API_KEY" not in os.environ:
 
 We will be using the [HaluBench dataset](https://huggingface.co/datasets/PatronusAI/HaluBench?library=pandas) which according to this [paper](https://arxiv.org/pdf/2407.08488) GPT-4o detects 87.9% of hallucinations. The first step will be to create a dataset in the platform so we can keep track of the results of the evaluation.
 
+Since the insert methods in the SDK deduplicates items, we can insert 50 items and if the items already exist, Opik will automatically remove them.
+
 
 ```python
 # Create dataset
@@ -44,30 +46,30 @@ import pandas as pd
 
 client = opik.Opik()
 
-try:
-    # Create dataset
-    dataset = client.create_dataset(name="HaluBench", description="HaluBench dataset")
+# Create dataset
+dataset = client.get_or_create_dataset(
+    name="HaluBench", description="HaluBench dataset"
+)
 
-    # Insert items into dataset
-    df = pd.read_parquet("hf://datasets/PatronusAI/HaluBench/data/test-00000-of-00001.parquet")
-    df = df.sample(n=50, random_state=42)
+# Insert items into dataset
+df = pd.read_parquet(
+    "hf://datasets/PatronusAI/HaluBench/data/test-00000-of-00001.parquet"
+)
+df = df.sample(n=50, random_state=42)
 
-    dataset_records = [
-        DatasetItem(
-            input = {
-                "input": x["question"],
-                "context": [x["passage"]],
-                "output": x["answer"]
-            },
-            expected_output = {"expected_output": x["label"]}
-        )
-        for x in df.to_dict(orient="records")
-    ]
-    
-    dataset.insert(dataset_records)
+dataset_records = [
+    DatasetItem(
+        input={
+            "input": x["question"],
+            "context": [x["passage"]],
+            "output": x["answer"],
+        },
+        expected_output={"expected_output": x["label"]},
+    )
+    for x in df.to_dict(orient="records")
+]
 
-except opik.rest_api.core.ApiError as e:
-    print("Dataset already exists")
+dataset.insert(dataset_records)
 ```
 
 ## Evaluating the hallucination metric
@@ -86,14 +88,13 @@ from opik.evaluation import evaluate
 from opik import Opik, DatasetItem
 from opik.evaluation.metrics.llm_judges.hallucination.template import generate_query
 
+
 # Define the evaluation task
 def evaluation_task(x: DatasetItem):
     metric = Hallucination()
     try:
         metric_score = metric.score(
-            input= x.input["input"],
-            context= x.input["context"],
-            output= x.input["output"]
+            input=x.input["input"], context=x.input["context"], output=x.input["output"]
         )
         hallucination_score = metric_score.value
         hallucination_reason = metric_score.reason
@@ -101,12 +102,13 @@ def evaluation_task(x: DatasetItem):
         print(e)
         hallucination_score = None
         hallucination_reason = str(e)
-    
+
     return {
         "output": "FAIL" if hallucination_score == 1 else "PASS",
         "hallucination_reason": hallucination_reason,
-        "reference": x.expected_output["expected_output"]
+        "reference": x.expected_output["expected_output"],
     }
+
 
 # Get the dataset
 client = Opik()
@@ -117,7 +119,9 @@ check_hallucinated_metric = Equals(name="Correct hallucination score")
 
 # Add the prompt template as an experiment configuration
 experiment_config = {
-    "prompt_template": generate_query(input="{input}",context="{context}",output="{output}",few_shot_examples=[])
+    "prompt_template": generate_query(
+        input="{input}", context="{context}", output="{output}", few_shot_examples=[]
+    )
 }
 
 res = evaluate(
@@ -125,7 +129,7 @@ res = evaluate(
     dataset=dataset,
     task=evaluation_task,
     scoring_metrics=[check_hallucinated_metric],
-    experiment_config=experiment_config
+    experiment_config=experiment_config,
 )
 ```
 

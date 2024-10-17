@@ -3144,6 +3144,27 @@ class SpansResourceTest {
     }
 
     @Test
+    void createAndGet__whenSpanInputIsBig__thenReturnSpan() {
+
+        int size = 1000;
+
+        Map<String, String> jsonMap = IntStream.range(0, size)
+                .mapToObj(i -> Map.entry(RandomStringUtils.randomAlphabetic(10), RandomStringUtils.randomAscii(size)))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        var expectedSpan = podamFactory.manufacturePojo(Span.class).toBuilder()
+                .projectId(null)
+                .parentSpanId(null)
+                .input(JsonUtils.readTree(jsonMap))
+                .output(JsonUtils.readTree(jsonMap))
+                .build();
+
+        createAndAssert(expectedSpan, API_KEY, TEST_WORKSPACE);
+
+        getAndAssert(expectedSpan, API_KEY, TEST_WORKSPACE);
+    }
+
+    @Test
     void createOnlyRequiredFieldsAndGetById() {
         var expectedSpan = podamFactory.manufacturePojo(Span.class)
                 .toBuilder()
@@ -3568,7 +3589,7 @@ class SpansResourceTest {
             assertThat(actualEntity.metadata()).isEqualTo(spanUpdate.metadata());
             assertThat(actualEntity.tags()).isEqualTo(spanUpdate.tags());
 
-            assertThat(actualEntity.name()).isEqualTo("");
+            assertThat(actualEntity.name()).isEmpty();
             assertThat(actualEntity.startTime()).isEqualTo(Instant.EPOCH);
             assertThat(actualEntity.type()).isNull();
         }
@@ -4550,37 +4571,6 @@ class SpansResourceTest {
 
                 assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(204);
                 assertThat(actualResponse.hasEntity()).isFalse();
-            }
-
-        }
-
-        @Test
-        @DisplayName("when feedback span project and score project do not match, then return conflict")
-        void feedback__whenFeedbackSpanProjectAndScoreProjectDoNotMatch__thenReturnConflict() {
-
-            var expectedSpan = podamFactory.manufacturePojo(Span.class).toBuilder()
-                    .projectId(null)
-                    .parentSpanId(null)
-                    .build();
-
-            var id = createAndAssert(expectedSpan, API_KEY, TEST_WORKSPACE);
-
-            var score = podamFactory.manufacturePojo(FeedbackScoreBatchItem.class).toBuilder()
-                    .id(id)
-                    .projectName(UUID.randomUUID().toString())
-                    .build();
-
-            try (var actualResponse = client.target(URL_TEMPLATE.formatted(baseURI))
-                    .path("feedback-scores")
-                    .request()
-                    .header(HttpHeaders.AUTHORIZATION, API_KEY)
-                    .header(WORKSPACE_HEADER, TEST_WORKSPACE)
-                    .put(Entity.json(new FeedbackScoreBatch(List.of(score))))) {
-
-                assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(409);
-                assertThat(actualResponse.hasEntity()).isTrue();
-                assertThat(actualResponse.readEntity(ErrorMessage.class).errors())
-                        .contains("project_name from score and project_id from span does not match");
             }
 
         }

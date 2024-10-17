@@ -6,14 +6,17 @@ import com.comet.opik.api.DatasetItemSource;
 import com.comet.opik.api.ExperimentItem;
 import com.comet.opik.api.FeedbackScore;
 import com.comet.opik.api.ScoreSource;
+import com.comet.opik.domain.filter.FilterQueryBuilder;
+import com.comet.opik.domain.filter.FilterStrategy;
 import com.comet.opik.infrastructure.db.TransactionTemplateAsync;
 import com.comet.opik.utils.JsonUtils;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.collect.Sets;
 import com.google.inject.ImplementedBy;
-import com.newrelic.api.agent.Segment;
-import com.newrelic.api.agent.Trace;
+import io.opentelemetry.instrumentation.annotations.WithSpan;
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.Result;
+import io.r2dbc.spi.Row;
 import io.r2dbc.spi.Statement;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
@@ -31,19 +34,28 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static com.comet.opik.api.DatasetItem.DatasetItemPage;
+import static com.comet.opik.api.DatasetItem.DatasetItemPage.Column;
 import static com.comet.opik.domain.AsyncContextUtils.bindWorkspaceIdToFlux;
+import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.Segment;
+import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.endSegment;
 import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.startSegment;
 import static com.comet.opik.utils.AsyncUtils.makeFluxContextAware;
 import static com.comet.opik.utils.AsyncUtils.makeMonoContextAware;
 import static com.comet.opik.utils.TemplateUtils.QueryItem;
 import static com.comet.opik.utils.TemplateUtils.getQueryItemPlaceHolder;
 import static com.comet.opik.utils.ValidationUtils.CLICKHOUSE_FIXED_STRING_UUID_FIELD_NULL_VALUE;
+import static java.util.function.Predicate.not;
+import static java.util.stream.Collectors.toMap;
 
 @ImplementedBy(DatasetItemDAOImpl.class)
 public interface DatasetItemDAO {
@@ -75,6 +87,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
                     trace_id,
                     span_id,
                     input,
+                    data,
                     expected_output,
                     metadata,
                     created_at,
@@ -91,6 +104,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
                              :traceId<item.index>,
                              :spanId<item.index>,
                              :input<item.index>,
+                             :data<item.index>,
                              :expectedOutput<item.index>,
                              :metadata<item.index>,
                              now64(9),
@@ -153,10 +167,12 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
 
     private static final String SELECT_DATASET_ITEMS_COUNT = """
                 SELECT
-                    count(id) AS count
+                    count(id) AS count,
+                    arrayDistinct(arrayFlatten(groupArray(arrayMap(key -> (key, JSONType(data[key])), mapKeys(data)))))  AS columns
                 FROM (
                     SELECT
-                        id
+                        id,
+                        data
                     FROM dataset_items
                     WHERE dataset_id = :datasetId
                     AND workspace_id = :workspace_id
@@ -171,27 +187,60 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
      */
     private static final String SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS_COUNT = """
                 SELECT
-                    COUNT(DISTINCT di.id) AS count
+                    COUNT(DISTINCT di.id) AS count,
+                    arrayDistinct(arrayFlatten(groupArray(arrayMap(key -> (key, JSONType(di.data[key])), mapKeys(di.data)))))  AS columns
                 FROM (
                     SELECT
-                        id
+                        id,
+                        data
                     FROM dataset_items
                     WHERE dataset_id = :datasetId
                     AND workspace_id = :workspace_id
+                    <if(dataset_item_filters)>
+                    AND <dataset_item_filters>
+                    <endif>
                     ORDER BY id DESC, last_updated_at DESC
                     LIMIT 1 BY id
                 ) AS di
                 INNER JOIN (
                     SELECT
-                        dataset_item_id
-                    FROM experiment_items
+                        dataset_item_id,
+                        trace_id
+                    FROM experiment_items ei
+                    <if(experiment_item_filters || feedback_scores_filters)>
+                    INNER JOIN (
+                        SELECT
+                            id
+                        FROM traces
+                        WHERE workspace_id = :workspace_id
+                        <if(experiment_item_filters)>
+                        AND <experiment_item_filters>
+                        <endif>
+                        <if(feedback_scores_filters)>
+                        AND id in (
+                            SELECT
+                                entity_id
+                            FROM (
+                                SELECT *
+                                FROM feedback_scores
+                                WHERE entity_type = 'trace'
+                                AND workspace_id = :workspace_id
+                                ORDER BY entity_id DESC, last_updated_at DESC
+                                LIMIT 1 BY entity_id, name
+                            )
+                            GROUP BY entity_id
+                            HAVING <feedback_scores_filters>
+                        )
+                        <endif>
+                        ORDER BY id DESC, last_updated_at DESC
+                        LIMIT 1 BY id
+                    ) AS tfs ON ei.trace_id = tfs.id
+                    <endif>
                     WHERE experiment_id in :experimentIds
                     AND workspace_id = :workspace_id
                     ORDER BY id DESC, last_updated_at DESC
                     LIMIT 1 BY id
                 ) AS ei ON di.id = ei.dataset_item_id
-                GROUP BY
-                    di.id
                 ;
             """;
 
@@ -237,7 +286,9 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
     private static final String SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS = """
             SELECT
                 di.id AS id,
+                di.dataset_id AS dataset_id,
                 di.input AS input,
+                di.data AS data,
                 di.expected_output AS expected_output,
                 di.metadata AS metadata,
                 di.trace_id AS trace_id,
@@ -266,13 +317,45 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
                 FROM dataset_items
                 WHERE dataset_id = :datasetId
                 AND workspace_id = :workspace_id
+                <if(dataset_item_filters)>
+                AND <dataset_item_filters>
+                <endif>
                 ORDER BY id DESC, last_updated_at DESC
                 LIMIT 1 BY id
             ) AS di
             INNER JOIN (
                 SELECT
-                    *
-                FROM experiment_items
+                    DISTINCT ei.*
+                FROM experiment_items ei
+                <if(experiment_item_filters || feedback_scores_filters)>
+                INNER JOIN (
+                    SELECT
+                        id
+                    FROM traces
+                    WHERE workspace_id = :workspace_id
+                    <if(experiment_item_filters)>
+                    AND <experiment_item_filters>
+                    <endif>
+                    <if(feedback_scores_filters)>
+                    AND id in (
+                        SELECT
+                            entity_id
+                        FROM (
+                            SELECT *
+                            FROM feedback_scores
+                            WHERE entity_type = 'trace'
+                            AND workspace_id = :workspace_id
+                            ORDER BY entity_id DESC, last_updated_at DESC
+                            LIMIT 1 BY entity_id, name
+                        )
+                        GROUP BY entity_id
+                        HAVING <feedback_scores_filters>
+                    )
+                    <endif>
+                    ORDER BY id DESC, last_updated_at DESC
+                    LIMIT 1 BY id
+                ) AS tfs ON ei.trace_id = tfs.id
+                <endif>
                 WHERE experiment_id in :experimentIds
                 AND workspace_id = :workspace_id
                 ORDER BY id DESC, last_updated_at DESC
@@ -322,7 +405,9 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             ) AS tfs ON ei.trace_id = tfs.id
             GROUP BY
                 di.id,
+                di.dataset_id,
                 di.input,
+                di.data,
                 di.expected_output,
                 di.metadata,
                 di.trace_id,
@@ -338,9 +423,10 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             """;
 
     private final @NonNull TransactionTemplateAsync asyncTemplate;
+    private final @NonNull FilterQueryBuilder filterQueryBuilder;
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> save(@NonNull UUID datasetId, @NonNull List<DatasetItem> items) {
 
         if (items.isEmpty()) {
@@ -369,12 +455,27 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
 
             int i = 0;
             for (DatasetItem item : items) {
+                Map<String, JsonNode> data = new HashMap<>(Optional.ofNullable(item.data()).orElse(Map.of()));
+
+                if (!data.containsKey("input") && item.input() != null) {
+                    data.put("input", item.input());
+                }
+
+                if (!data.containsKey("expected_output") && item.expectedOutput() != null) {
+                    data.put("expected_output", item.expectedOutput());
+                }
+
+                if (!data.containsKey("metadata") && item.metadata() != null) {
+                    data.put("metadata", item.metadata());
+                }
+
                 statement.bind("id" + i, item.id());
                 statement.bind("datasetId" + i, datasetId);
                 statement.bind("source" + i, item.source().getValue());
                 statement.bind("traceId" + i, getOrDefault(item.traceId()));
                 statement.bind("spanId" + i, getOrDefault(item.spanId()));
                 statement.bind("input" + i, getOrDefault(item.input()));
+                statement.bind("data" + i, getOrDefault(data));
                 statement.bind("expectedOutput" + i, getOrDefault(item.expectedOutput()));
                 statement.bind("metadata" + i, getOrDefault(item.metadata()));
                 statement.bind("createdBy" + i, userName);
@@ -387,7 +488,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             return Flux.from(statement.execute())
                     .flatMap(Result::getRowsUpdated)
                     .reduce(0L, Long::sum)
-                    .doFinally(signalType -> segment.end());
+                    .doFinally(signalType -> endSegment(segment));
         });
     }
 
@@ -395,37 +496,90 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
         return Optional.ofNullable(jsonNode).map(JsonNode::toString).orElse("");
     }
 
+    private Map<String, String> getOrDefault(Map<String, JsonNode> data) {
+        return Optional.ofNullable(data)
+                .filter(not(Map::isEmpty))
+                .stream()
+                .map(Map::entrySet)
+                .flatMap(Collection::stream)
+                .map(entry -> Map.entry(entry.getKey(), entry.getValue().toString()))
+                .collect(toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+
     private String getOrDefault(UUID value) {
         return Optional.ofNullable(value).map(UUID::toString).orElse("");
     }
 
     private Publisher<DatasetItem> mapItem(Result results) {
-        return results.map((row, rowMetadata) -> DatasetItem.builder()
-                .id(row.get("id", UUID.class))
-                .input(Optional.ofNullable(row.get("input", String.class))
-                        .filter(s -> !s.isBlank())
-                        .map(JsonUtils::getJsonNodeFromString).orElse(null))
-                .expectedOutput(Optional.ofNullable(row.get("expected_output", String.class))
-                        .filter(s -> !s.isBlank())
-                        .map(JsonUtils::getJsonNodeFromString).orElse(null))
-                .metadata(Optional.ofNullable(row.get("metadata", String.class))
-                        .filter(s -> !s.isBlank())
-                        .map(JsonUtils::getJsonNodeFromString).orElse(null))
-                .source(DatasetItemSource.fromString(row.get("source", String.class)))
-                .traceId(Optional.ofNullable(row.get("trace_id", String.class))
-                        .filter(s -> !s.isBlank())
-                        .map(UUID::fromString)
-                        .orElse(null))
-                .spanId(Optional.ofNullable(row.get("span_id", String.class))
-                        .filter(s -> !s.isBlank())
-                        .map(UUID::fromString)
-                        .orElse(null))
-                .experimentItems(getExperimentItems(row.get("experiment_items_array", List[].class)))
-                .lastUpdatedAt(row.get("last_updated_at", Instant.class))
-                .createdAt(row.get("created_at", Instant.class))
-                .createdBy(row.get("created_by", String.class))
-                .lastUpdatedBy(row.get("last_updated_by", String.class))
-                .build());
+        return results.map((row, rowMetadata) -> {
+
+            Map<String, JsonNode> data = new HashMap<>(getData(row));
+
+            JsonNode input = getJsonNode(row, data, "input");
+            JsonNode expectedOutput = getJsonNode(row, data, "expected_output");
+            JsonNode metadata = getJsonNode(row, data, "metadata");
+
+            if (!data.containsKey("input")) {
+                data.put("input", input);
+            }
+
+            if (!data.containsKey("expected_output")) {
+                data.put("expected_output", expectedOutput);
+            }
+
+            if (!data.containsKey("metadata")) {
+                data.put("metadata", metadata);
+            }
+
+            return DatasetItem.builder()
+                    .id(row.get("id", UUID.class))
+                    .input(input)
+                    .data(data)
+                    .expectedOutput(expectedOutput)
+                    .metadata(metadata)
+                    .source(DatasetItemSource.fromString(row.get("source", String.class)))
+                    .traceId(Optional.ofNullable(row.get("trace_id", String.class))
+                            .filter(s -> !s.isBlank())
+                            .map(UUID::fromString)
+                            .orElse(null))
+                    .spanId(Optional.ofNullable(row.get("span_id", String.class))
+                            .filter(s -> !s.isBlank())
+                            .map(UUID::fromString)
+                            .orElse(null))
+                    .experimentItems(getExperimentItems(row.get("experiment_items_array", List[].class)))
+                    .lastUpdatedAt(row.get("last_updated_at", Instant.class))
+                    .createdAt(row.get("created_at", Instant.class))
+                    .createdBy(row.get("created_by", String.class))
+                    .lastUpdatedBy(row.get("last_updated_by", String.class))
+                    .build();
+        });
+    }
+
+    private Map<String, JsonNode> getData(Row row) {
+        return Optional.ofNullable(row.get("data", Map.class))
+                .filter(s -> !s.isEmpty())
+                .map(value -> (Map<String, String>) value)
+                .stream()
+                .map(Map::entrySet)
+                .flatMap(Collection::stream)
+                .map(entry -> Map.entry(entry.getKey(), JsonUtils.getJsonNodeFromString(entry.getValue())))
+                .collect(toMap(Map.Entry::getKey, Map.Entry::getValue));
+    }
+
+    private JsonNode getJsonNode(Row row, Map<String, JsonNode> data, String key) {
+        JsonNode json = null;
+
+        if (data.containsKey(key)) {
+            json = data.get(key);
+        }
+
+        if (json == null) {
+            json = Optional.ofNullable(row.get(key, String.class))
+                    .filter(s -> !s.isBlank())
+                    .map(JsonUtils::getJsonNodeFromString).orElse(null);
+        }
+
+        return json;
     }
 
     private List<ExperimentItem> getExperimentItems(List[] experimentItemsArrays) {
@@ -465,12 +619,14 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
         if (feedbackScoresRaw instanceof List[] feedbackScoresArray) {
             var feedbackScores = Arrays.stream(feedbackScoresArray)
                     .filter(feedbackScore -> CollectionUtils.isNotEmpty(feedbackScore) &&
-                            !CLICKHOUSE_FIXED_STRING_UUID_FIELD_NULL_VALUE.equals(feedbackScore.get(0).toString()))
+                            !CLICKHOUSE_FIXED_STRING_UUID_FIELD_NULL_VALUE.equals(feedbackScore.getFirst().toString()))
                     .map(feedbackScore -> FeedbackScore.builder()
                             .name(feedbackScore.get(1).toString())
-                            .categoryName(Optional.ofNullable(feedbackScore.get(2)).map(Object::toString).orElse(null))
+                            .categoryName(Optional.ofNullable(feedbackScore.get(2)).map(Object::toString)
+                                    .filter(StringUtils::isNotEmpty).orElse(null))
                             .value(new BigDecimal(feedbackScore.get(3).toString()))
-                            .reason(Optional.ofNullable(feedbackScore.get(4)).map(Object::toString).orElse(null))
+                            .reason(Optional.ofNullable(feedbackScore.get(4)).map(Object::toString)
+                                    .filter(StringUtils::isNotEmpty).orElse(null))
                             .source(ScoreSource.fromString(feedbackScore.get(5).toString()))
                             .build())
                     .toList();
@@ -480,7 +636,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
     }
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<DatasetItem> get(@NonNull UUID id) {
         return asyncTemplate.nonTransaction(connection -> {
 
@@ -490,14 +646,14 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             Segment segment = startSegment("dataset_items", "Clickhouse", "select_dataset_item");
 
             return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
-                    .doFinally(signalType -> segment.end())
+                    .doFinally(signalType -> endSegment(segment))
                     .flatMap(this::mapItem)
                     .singleOrEmpty();
         });
     }
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Flux<DatasetItem> getItems(@NonNull UUID datasetId, int limit, UUID lastRetrievedId) {
         log.info("Getting dataset items by datasetId '{}', limit '{}', lastRetrievedId '{}'",
                 datasetId, limit, lastRetrievedId);
@@ -521,13 +677,13 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             Segment segment = startSegment("dataset_items", "Clickhouse", "select_dataset_items_stream");
 
             return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
-                    .doFinally(signalType -> segment.end())
+                    .doFinally(signalType -> endSegment(segment))
                     .flatMap(this::mapItem);
         });
     }
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<List<WorkspaceAndResourceId>> getDatasetItemWorkspace(@NonNull Set<UUID> datasetItemIds) {
 
         if (datasetItemIds.isEmpty()) {
@@ -548,7 +704,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
     }
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<Long> delete(@NonNull List<UUID> ids) {
         if (ids.isEmpty()) {
             return Mono.empty();
@@ -563,7 +719,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
             return bindAndDelete(ids, statement)
                     .flatMap(Result::getRowsUpdated)
                     .reduce(0L, Long::sum)
-                    .doFinally(signalType -> segment.end());
+                    .doFinally(signalType -> endSegment(segment));
         });
     }
 
@@ -575,7 +731,7 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
     }
 
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<DatasetItemPage> getItems(@NonNull UUID datasetId, int page, int size) {
 
         Segment segmentCount = startSegment("dataset_items", "Clickhouse", "select_dataset_items_page_count");
@@ -586,12 +742,16 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
                                 .bind("datasetId", datasetId)
                                 .bind("workspace_id", workspaceId)
                                 .execute())
-                        .doFinally(signalType -> segmentCount.end())
-                        .flatMap(result -> result.map((row, rowMetadata) -> row.get(0, Long.class)))
-                        .reduce(0L, Long::sum)
-                        .flatMap(count -> {
+                        .doFinally(signalType -> endSegment(segmentCount))
+                        .flatMap(this::mapCount)
+                        .reduce((result1, result2) -> Map.entry(result1.getKey() + result2.getKey(),
+                                Sets.union(result1.getValue(), result2.getValue())))
+                        .flatMap(result -> {
 
                             Segment segment = startSegment("dataset_items", "Clickhouse", "select_dataset_items_page");
+
+                            long total = result.getKey();
+                            Set<Column> columns = result.getValue();
 
                             return Flux.from(connection.createStatement(SELECT_DATASET_ITEMS)
                                     .bind("workspace_id", workspaceId)
@@ -601,13 +761,51 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
                                     .execute())
                                     .flatMap(this::mapItem)
                                     .collectList()
-                                    .flatMap(items -> Mono.just(new DatasetItemPage(items, page, items.size(), count)))
-                                    .doFinally(signalType -> segment.end());
+                                    .flatMap(items -> Mono
+                                            .just(new DatasetItemPage(items, page, items.size(), total, columns)))
+                                    .doFinally(signalType -> endSegment(segment));
                         })));
     }
 
+    private Publisher<Map.Entry<Long, Set<Column>>> mapCount(Result result) {
+        return result.map((row, rowMetadata) -> Map.entry(
+                row.get(0, Long.class),
+                ((List<List<String>>) row.get(1, List.class))
+                        .stream()
+                        .map(columnArray -> new Column(columnArray.getFirst(), columnArray.get(1)))
+                        .collect(Collectors.toSet())));
+    }
+
+    private ST newFindTemplate(String query, DatasetItemSearchCriteria datasetItemSearchCriteria) {
+        var template = new ST(query);
+
+        Optional.ofNullable(datasetItemSearchCriteria.filters())
+                .ifPresent(filters -> {
+                    filterQueryBuilder.toAnalyticsDbFilters(filters, FilterStrategy.DATASET_ITEM)
+                            .ifPresent(datasetItemFilters -> template.add("dataset_item_filters", datasetItemFilters));
+
+                    filterQueryBuilder.toAnalyticsDbFilters(filters, FilterStrategy.EXPERIMENT_ITEM)
+                            .ifPresent(experimentItemFilters -> template.add("experiment_item_filters",
+                                    experimentItemFilters));
+
+                    filterQueryBuilder.toAnalyticsDbFilters(filters, FilterStrategy.FEEDBACK_SCORES)
+                            .ifPresent(scoresFilters -> template.add("feedback_scores_filters", scoresFilters));
+                });
+
+        return template;
+    }
+
+    private void bindSearchCriteria(DatasetItemSearchCriteria datasetItemSearchCriteria, Statement statement) {
+        Optional.ofNullable(datasetItemSearchCriteria.filters())
+                .ifPresent(filters -> {
+                    filterQueryBuilder.bind(statement, filters, FilterStrategy.DATASET_ITEM);
+                    filterQueryBuilder.bind(statement, filters, FilterStrategy.EXPERIMENT_ITEM);
+                    filterQueryBuilder.bind(statement, filters, FilterStrategy.FEEDBACK_SCORES);
+                });
+    }
+
     @Override
-    @Trace(dispatcher = true)
+    @WithSpan
     public Mono<DatasetItemPage> getItems(
             @NonNull DatasetItemSearchCriteria datasetItemSearchCriteria, int page, int size) {
         log.info("Finding dataset items with experiment items by '{}', page '{}', size '{}'",
@@ -615,37 +813,48 @@ class DatasetItemDAOImpl implements DatasetItemDAO {
 
         Segment segmentCount = startSegment("dataset_items", "Clickhouse", "select_dataset_items_filters_count");
 
-        return makeMonoContextAware((userName, workspaceName, workspaceId) -> asyncTemplate.nonTransaction(
-                connection -> Flux
-                        .from(connection
-                                .createStatement(
-                                        SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS_COUNT)
-                                .bind("datasetId", datasetItemSearchCriteria.datasetId())
-                                .bind("experimentIds", datasetItemSearchCriteria.experimentIds())
-                                .bind("workspace_id", workspaceId)
-                                .execute())
-                        .doFinally(signalType -> segmentCount.end())
-                        .flatMap(result -> result.map((row, rowMetadata) -> row.get(0, Long.class)))
-                        .reduce(0L, Long::sum)
-                        .flatMap(count -> {
-                            Segment segment = startSegment("dataset_items", "Clickhouse",
-                                    "select_dataset_items_filters");
+        return asyncTemplate.nonTransaction(connection -> {
 
-                            return Flux
-                                    .from(connection
-                                            .createStatement(
-                                                    SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS)
-                                            .bind("datasetId", datasetItemSearchCriteria.datasetId())
-                                            .bind("experimentIds", datasetItemSearchCriteria.experimentIds())
-                                            .bind("entityType", datasetItemSearchCriteria.entityType().getType())
-                                            .bind("workspace_id", workspaceId)
-                                            .bind("limit", size)
-                                            .bind("offset", (page - 1) * size)
-                                            .execute())
-                                    .doFinally(signalType -> segment.end())
-                                    .flatMap(this::mapItem)
-                                    .collectList()
-                                    .flatMap(items -> Mono.just(new DatasetItemPage(items, page, items.size(), count)));
-                        })));
+            ST countTemplate = newFindTemplate(SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS_COUNT,
+                    datasetItemSearchCriteria);
+
+            var statement = connection.createStatement(countTemplate.render())
+                    .bind("datasetId", datasetItemSearchCriteria.datasetId())
+                    .bind("experimentIds", datasetItemSearchCriteria.experimentIds().toArray(UUID[]::new));
+
+            bindSearchCriteria(datasetItemSearchCriteria, statement);
+
+            return makeFluxContextAware(bindWorkspaceIdToFlux(statement))
+                    .doFinally(signalType -> endSegment(segmentCount))
+                    .flatMap(this::mapCount)
+                    .reduce((result1, result2) -> Map.entry(result1.getKey() + result2.getKey(),
+                            Sets.union(result1.getValue(), result2.getValue())))
+                    .flatMap(result -> {
+
+                        Segment segment = startSegment("dataset_items", "Clickhouse", "select_dataset_items_filters");
+
+                        ST selectTemplate = newFindTemplate(SELECT_DATASET_ITEMS_WITH_EXPERIMENT_ITEMS,
+                                datasetItemSearchCriteria);
+
+                        var selectStatement = connection.createStatement(selectTemplate.render())
+                                .bind("datasetId", datasetItemSearchCriteria.datasetId())
+                                .bind("experimentIds", datasetItemSearchCriteria.experimentIds().toArray(UUID[]::new))
+                                .bind("entityType", datasetItemSearchCriteria.entityType().getType())
+                                .bind("limit", size)
+                                .bind("offset", (page - 1) * size);
+
+                        bindSearchCriteria(datasetItemSearchCriteria, selectStatement);
+
+                        Long total = result.getKey();
+                        Set<Column> columns = result.getValue();
+
+                        return makeFluxContextAware(bindWorkspaceIdToFlux(selectStatement))
+                                .doFinally(signalType -> endSegment(segment))
+                                .flatMap(this::mapItem)
+                                .collectList()
+                                .flatMap(items -> Mono
+                                        .just(new DatasetItemPage(items, page, items.size(), total, columns)));
+                    });
+        });
     }
 }

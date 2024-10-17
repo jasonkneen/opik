@@ -1,5 +1,4 @@
 import opik.config
-import opik.api_objects.opik_client
 
 
 def get_ui_url() -> str:
@@ -21,11 +20,9 @@ def get_experiment_url(dataset_name: str, experiment_id: str) -> str:
     config = opik.config.OpikConfig()
     ui_url = get_ui_url()
 
-    return f'{ui_url}/{config.workspace}/experiments/{dataset_id}/compare?experiments=%5B"{experiment_id}"%5D'
+    return f"{ui_url}/{config.workspace}/experiments/{dataset_id}/compare?experiments=%5B%22{experiment_id}%22%5D"
 
 
-def get_projects_url() -> str:
-    config = opik.config.OpikConfig()
+def get_projects_url(workspace: str) -> str:
     ui_url = get_ui_url()
-
-    return f"{ui_url}/{config.workspace}/projects"
+    return f"{ui_url}/{workspace}/projects"
