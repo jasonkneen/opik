@@ -15,11 +15,11 @@ from . import (
     constants,
     validation_helpers,
 )
-from ..message_processing import streamer_constructors, messages, jsonable_encoder
+from ..message_processing import streamer_constructors, messages
 from ..rest_api import client as rest_api_client
 from ..rest_api.types import dataset_public, trace_public, span_public, project_public
 from ..rest_api.core.api_error import ApiError
-from .. import datetime_helpers, config, httpx_client
+from .. import datetime_helpers, config, httpx_client, jsonable_encoder, url_helpers
 
 
 LOGGER = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ class Opik:
         self._workspace: str = config_.workspace
         self._project_name: str = config_.project_name
         self._flush_timeout: Optional[int] = config_.default_flush_timeout
+        self._project_name_most_recent_trace: Optional[str] = None
 
         self._initialize_streamer(
             base_url=config_.url_override,
@@ -79,6 +80,18 @@ class Opik:
             use_batching=use_batching,
         )
 
+    def _display_trace_url(self, workspace: str, project_name: str) -> None:
+        projects_url = url_helpers.get_projects_url(workspace=workspace)
+
+        if (
+            self._project_name_most_recent_trace is None
+            or self._project_name_most_recent_trace != project_name
+        ):
+            LOGGER.info(
+                f'Started logging traces to the "{project_name}" project at {projects_url}.'
+            )
+            self._project_name_most_recent_trace = project_name
+
     def trace(
         self,
         id: Optional[str] = None,
@@ -105,7 +118,8 @@ class Opik:
             metadata: Additional metadata for the trace. This can be any valid JSON serializable object.
             tags: Tags associated with the trace.
             feedback_scores: The list of feedback score dicts associated with the trace. Dicts don't require to have an `id` value.
-            project_name: The name of the project.
+            project_name: The name of the project. If not set, the project name which was configured when Opik instance
+                was created will be used.
 
         Returns:
             trace.Trace: The created trace object.
@@ -126,12 +140,15 @@ class Opik:
             tags=tags,
         )
         self._streamer.put(create_trace_message)
+        self._display_trace_url(
+            workspace=self._workspace, project_name=project_name or self._project_name
+        )
 
         if feedback_scores is not None:
             for feedback_score in feedback_scores:
                 feedback_score["id"] = id
 
-            self.log_traces_feedback_scores(feedback_scores)
+            self.log_traces_feedback_scores(feedback_scores, project_name)
 
         return trace.Trace(
             id=id,
@@ -173,7 +190,8 @@ class Opik:
             tags: Tags associated with the span.
             usage: Usage data for the span.
             feedback_scores: The list of feedback score dicts associated with the span. Dicts don't require to have an `id` value.
-            project_name: The name of the project.
+            project_name: The name of the project. If not set, the project name which was configured when Opik instance
+                was created will be used.
 
         Returns:
             span.Span: The created span object.
@@ -229,7 +247,7 @@ class Opik:
             for feedback_score in feedback_scores:
                 feedback_score["id"] = id
 
-            self.log_spans_feedback_scores(feedback_scores)
+            self.log_spans_feedback_scores(feedback_scores, project_name)
 
         return span.Span(
             id=id,
@@ -239,13 +257,17 @@ class Opik:
             message_streamer=self._streamer,
         )
 
-    def log_spans_feedback_scores(self, scores: List[FeedbackScoreDict]) -> None:
+    def log_spans_feedback_scores(
+        self, scores: List[FeedbackScoreDict], project_name: Optional[str] = None
+    ) -> None:
         """
         Log feedback scores for spans.
 
         Args:
             scores (List[FeedbackScoreDict]): A list of feedback score dictionaries.
                 Specifying a span id via `id` key for each score is mandatory.
+            project_name: The name of the project in which the spans are logged. If not set, the project name
+                which was configured when Opik instance was created will be used.
 
         Returns:
             None
@@ -262,7 +284,7 @@ class Opik:
         score_messages = [
             messages.FeedbackScoreMessage(
                 source=constants.FEEDBACK_SCORE_SOURCE_SDK,
-                project_name=self._project_name,
+                project_name=project_name or self._project_name,
                 **score_dict,
             )
             for score_dict in valid_scores
@@ -277,13 +299,17 @@ class Opik:
 
             self._streamer.put(add_span_feedback_scores_batch_message)
 
-    def log_traces_feedback_scores(self, scores: List[FeedbackScoreDict]) -> None:
+    def log_traces_feedback_scores(
+        self, scores: List[FeedbackScoreDict], project_name: Optional[str] = None
+    ) -> None:
         """
         Log feedback scores for traces.
 
         Args:
             scores (List[FeedbackScoreDict]): A list of feedback score dictionaries.
                 Specifying a trace id via `id` key for each score is mandatory.
+            project_name: The name of the project in which the traces are logged. If not set, the project name
+                which was configured when Opik instance was created will be used.
 
         Returns:
             None
@@ -300,7 +326,7 @@ class Opik:
         score_messages = [
             messages.FeedbackScoreMessage(
                 source=constants.FEEDBACK_SCORE_SOURCE_SDK,
-                project_name=self._project_name,
+                project_name=project_name or self._project_name,
                 **score_dict,
             )
             for score_dict in valid_scores

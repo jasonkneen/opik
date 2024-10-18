@@ -275,10 +275,10 @@ const UserMenu = () => {
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
           <DropdownMenuGroup>
-            <Link to="/$workspaceName/get-started" params={{ workspaceName }}>
+            <Link to="/$workspaceName/quickstart" params={{ workspaceName }}>
               <DropdownMenuItem className="cursor-pointer">
                 <GraduationCap className="mr-2 size-4" />
-                <span>Get started guide</span>
+                <span>Quickstart guide</span>
               </DropdownMenuItem>
             </Link>
             <a href={buildUrl("docs/opik/")} target="_blank" rel="noreferrer">
@@ -356,7 +356,7 @@ const UserMenu = () => {
   };
 
   return (
-    <div className="flex items-center gap-4">
+    <div className="flex shrink-0 items-center gap-4">
       {renderAppSelector()}
       {renderUserMenu()}
     </div>

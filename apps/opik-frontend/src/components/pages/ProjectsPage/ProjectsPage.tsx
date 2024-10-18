@@ -36,21 +36,25 @@ export const DEFAULT_COLUMNS: ColumnData<Project>[] = [
     type: COLUMN_TYPE.string,
   },
   {
-    id: "created_at",
-    label: "Created",
-    type: COLUMN_TYPE.time,
-    accessorFn: (row) => formatDate(row.created_at),
-  },
-  {
     id: "last_updated_at",
     label: "Last updated",
     type: COLUMN_TYPE.time,
     accessorFn: (row) =>
       formatDate(row.last_updated_trace_at ?? row.created_at),
   },
+  {
+    id: "created_at",
+    label: "Created",
+    type: COLUMN_TYPE.time,
+    accessorFn: (row) => formatDate(row.created_at),
+  },
 ];
 
-export const DEFAULT_SELECTED_COLUMNS: string[] = ["name", "created_at"];
+export const DEFAULT_SELECTED_COLUMNS: string[] = [
+  "name",
+  "last_updated_at",
+  "created_at",
+];
 
 const ProjectsPage: React.FunctionComponent = () => {
   const navigate = useNavigate();
@@ -153,7 +157,7 @@ const ProjectsPage: React.FunctionComponent = () => {
   return (
     <div className="pt-6">
       <div className="mb-4 flex items-center justify-between">
-        <h1 className="comet-title-l">Projects</h1>
+        <h1 className="comet-title-l truncate break-words">Projects</h1>
       </div>
       <div className="mb-4 flex items-center justify-between gap-8">
         <SearchInput
@@ -190,7 +194,7 @@ const ProjectsPage: React.FunctionComponent = () => {
           </DataTableNoData>
         }
       />
-      <div className="pl-6 pr-5 pt-4">
+      <div className="py-4">
         <DataTablePagination
           page={page}
           pageChange={setPage}

@@ -58,10 +58,10 @@ if not os.path.exists(folder):
 
 if not os.path.exists(filename):
     response = requests.get(url)
-    with open(filename, 'wb') as file:
+    with open(filename, "wb") as file:
         file.write(response.content)
-    print(f"Chinook database downloaded")
-    
+    print("Chinook database downloaded")
+
 db = SQLDatabase.from_uri(f"sqlite:///{filename}")
 ```
 
@@ -91,16 +91,15 @@ Return the response as a json object with a "result" key and an array of strings
 """
 
 completion = openai_client.chat.completions.create(
-  model="gpt-3.5-turbo",
-  messages=[
-    {"role": "user", "content": prompt}
-  ]
+    model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}]
 )
 
 print(completion.choices[0].message.content)
 ```
 
 Now that we have our synthetic dataset, we can create a dataset in Comet and insert the questions into it.
+
+Since the insert methods in the SDK deduplicates items, we can insert 20 items and if the items already exist, Opik will automatically remove them.
 
 
 ```python
@@ -111,13 +110,11 @@ from opik import DatasetItem
 synthetic_questions = json.loads(completion.choices[0].message.content)["result"]
 
 client = opik.Opik()
-try:
-    dataset = client.create_dataset(name="synthetic_questions")
-    dataset.insert([
-        DatasetItem(input={"question": question}) for question in synthetic_questions
-    ])
-except opik.rest_api.core.ApiError as e:
-    print("Dataset already exists")
+
+dataset = client.get_or_create_dataset(name="synthetic_questions")
+dataset.insert(
+    [DatasetItem(input={"question": question}) for question in synthetic_questions]
+)
 ```
 
 ## Creating a LangChain chain
@@ -156,6 +153,7 @@ from opik.evaluation import evaluate
 from opik.evaluation.metrics import base_metric, score_result
 from typing import Any
 
+
 class ValidSQLQuery(base_metric.BaseMetric):
     def __init__(self, name: str, db: Any):
         self.name = name
@@ -167,41 +165,36 @@ class ValidSQLQuery(base_metric.BaseMetric):
         try:
             db.run(output)
             return score_result.ScoreResult(
-                name=self.name,
-                value=1,
-                reason="Query ran successfully"
+                name=self.name, value=1, reason="Query ran successfully"
             )
         except Exception as e:
-            return score_result.ScoreResult(
-                name=self.name,
-                value=0,
-                reason=str(e)
-            )
+            return score_result.ScoreResult(name=self.name, value=0, reason=str(e))
+
 
 valid_sql_query = ValidSQLQuery(name="valid_sql_query", db=db)
 
 client = Opik()
 dataset = client.get_dataset("synthetic_questions")
 
+
 @track()
 def llm_chain(input: str) -> str:
     response = chain.invoke({"question": input})
-    
+
     return response
+
 
 def evaluation_task(item):
     response = llm_chain(item.input["question"])
 
-    return {
-        "reference": "hello",
-        "output": response
-    }
+    return {"reference": "hello", "output": response}
+
 
 res = evaluate(
     experiment_name="SQL question answering",
     dataset=dataset,
     task=evaluation_task,
-    scoring_metrics=[valid_sql_query]
+    scoring_metrics=[valid_sql_query],
 )
 ```
 

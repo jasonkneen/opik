@@ -14,9 +14,14 @@ import com.comet.opik.api.ExperimentItemsBatch;
 import com.comet.opik.api.FeedbackScoreBatch;
 import com.comet.opik.api.FeedbackScoreBatchItem;
 import com.comet.opik.api.Project;
+import com.comet.opik.api.ScoreSource;
 import com.comet.opik.api.Span;
 import com.comet.opik.api.Trace;
 import com.comet.opik.api.error.ErrorMessage;
+import com.comet.opik.api.filter.ExperimentsComparisonField;
+import com.comet.opik.api.filter.ExperimentsComparisonFilter;
+import com.comet.opik.api.filter.Filter;
+import com.comet.opik.api.filter.Operator;
 import com.comet.opik.api.resources.utils.AuthTestUtils;
 import com.comet.opik.api.resources.utils.ClickHouseContainerUtils;
 import com.comet.opik.api.resources.utils.ClientSupportUtils;
@@ -31,15 +36,19 @@ import com.comet.opik.podam.PodamFactoryUtils;
 import com.comet.opik.utils.JsonUtils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import com.fasterxml.uuid.Generators;
 import com.fasterxml.uuid.impl.TimeBasedEpochGenerator;
-import com.github.tomakehurst.wiremock.client.WireMock;
 import com.redis.testcontainers.RedisContainer;
 import jakarta.ws.rs.client.Entity;
 import jakarta.ws.rs.core.GenericType;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.glassfish.jersey.client.ChunkedInput;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
@@ -54,18 +63,27 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.testcontainers.containers.ClickHouseContainer;
+import org.testcontainers.clickhouse.ClickHouseContainer;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import reactor.core.publisher.Mono;
 import ru.vyarus.dropwizard.guice.test.ClientSupport;
 import ru.vyarus.dropwizard.guice.test.jupiter.ext.TestDropwizardAppExtension;
 import uk.co.jemos.podam.api.PodamFactory;
 
 import java.math.BigDecimal;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -73,6 +91,7 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static com.comet.opik.api.DatasetItem.DatasetItemPage;
+import static com.comet.opik.api.DatasetItem.DatasetItemPage.Column;
 import static com.comet.opik.api.resources.utils.ClickHouseContainerUtils.DATABASE_NAME;
 import static com.comet.opik.api.resources.utils.MigrationUtils.CLICKHOUSE_CHANGELOG_FILE;
 import static com.comet.opik.api.resources.utils.WireMockUtils.WireMockRuntime;
@@ -84,7 +103,14 @@ import static com.github.tomakehurst.wiremock.client.WireMock.matching;
 import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.unauthorized;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static java.util.stream.Collectors.flatMapping;
+import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.mapping;
+import static java.util.stream.Collectors.toMap;
+import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Collectors.toUnmodifiableSet;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
@@ -103,8 +129,9 @@ class DatasetsResourceTest {
     public static final String[] IGNORED_FIELDS_LIST = {"feedbackScores", "createdAt", "lastUpdatedAt", "createdBy",
             "lastUpdatedBy"};
     public static final String[] IGNORED_FIELDS_DATA_ITEM = {"createdAt", "lastUpdatedAt", "experimentItems",
-            "createdBy",
-            "lastUpdatedBy"};
+            "createdBy", "lastUpdatedBy"};
+    public static final String[] DATASET_IGNORED_FIELDS = {"id", "createdAt", "lastUpdatedAt", "createdBy",
+            "lastUpdatedBy", "experimentCount", "mostRecentExperimentAt", "experimentCount"};
 
     public static final String API_KEY = UUID.randomUUID().toString();
     private static final String USER = UUID.randomUUID().toString();
@@ -123,9 +150,6 @@ class DatasetsResourceTest {
     private static final TestDropwizardAppExtension app;
 
     private static final WireMockRuntime wireMock;
-
-    public static final String[] DATASET_IGNORED_FIELDS = {"id", "createdAt", "lastUpdatedAt", "createdBy",
-            "lastUpdatedBy", "experimentCount", "mostRecentExperimentAt", "experimentCount"};
 
     static {
         MYSQL.start();
@@ -253,13 +277,13 @@ class DatasetsResourceTest {
                     post(urlPathEqualTo("/opik/auth"))
                             .withHeader(HttpHeaders.AUTHORIZATION, equalTo(fakeApikey))
                             .withRequestBody(matchingJsonPath("$.workspaceName", matching(".+")))
-                            .willReturn(WireMock.unauthorized()));
+                            .willReturn(unauthorized()));
 
             wireMock.server().stubFor(
                     post(urlPathEqualTo("/opik/auth"))
                             .withHeader(HttpHeaders.AUTHORIZATION, equalTo(""))
                             .withRequestBody(matchingJsonPath("$.workspaceName", matching(".+")))
-                            .willReturn(WireMock.unauthorized()));
+                            .willReturn(unauthorized()));
         }
 
         @ParameterizedTest
@@ -724,7 +748,7 @@ class DatasetsResourceTest {
                     post(urlPathEqualTo("/opik/auth-session"))
                             .withCookie(SESSION_COOKIE, equalTo(fakeSessionToken))
                             .withRequestBody(matchingJsonPath("$.workspaceName", matching(".+")))
-                            .willReturn(WireMock.unauthorized()));
+                            .willReturn(unauthorized()));
         }
 
         Stream<Arguments> credentials() {
@@ -1446,7 +1470,7 @@ class DatasetsResourceTest {
                     .toList();
 
             var traceIdToScoresMap = Stream.concat(scores1.stream(), scores2.stream())
-                    .collect(Collectors.groupingBy(FeedbackScoreBatchItem::id));
+                    .collect(groupingBy(FeedbackScoreBatchItem::id));
 
             // When storing the scores in batch, adding some more unrelated random ones
             var feedbackScoreBatch = factory.manufacturePojo(FeedbackScoreBatch.class);
@@ -1475,7 +1499,7 @@ class DatasetsResourceTest {
                     .experimentItems(Stream.concat(
                             experimentItemsBatch.experimentItems().stream(),
                             experimentItems.stream())
-                            .collect(Collectors.toUnmodifiableSet()))
+                            .collect(toUnmodifiableSet()))
                     .build();
 
             Instant beforeCreateExperimentItems = Instant.now();
@@ -1849,7 +1873,7 @@ class DatasetsResourceTest {
                     .toList();
 
             var traceIdToScoresMap = scores.stream()
-                    .collect(Collectors.groupingBy(FeedbackScoreBatchItem::id));
+                    .collect(groupingBy(FeedbackScoreBatchItem::id));
 
             // When storing the scores in batch, adding some more unrelated random ones
             var feedbackScoreBatch = factory.manufacturePojo(FeedbackScoreBatch.class);
@@ -1873,7 +1897,7 @@ class DatasetsResourceTest {
                                     .map(FeedbackScoreMapper.INSTANCE::toFeedbackScore)
                                     .toList())
                             .build())
-                    .collect(Collectors.toSet());
+                    .collect(toSet());
 
             var experimentItemsBatch = factory.manufacturePojo(ExperimentItemsBatch.class).toBuilder()
                     .experimentItems(experimentItems)
@@ -2198,7 +2222,7 @@ class DatasetsResourceTest {
                     .request()
                     .header(HttpHeaders.AUTHORIZATION, API_KEY)
                     .header(WORKSPACE_HEADER, TEST_WORKSPACE)
-                    .put(Entity.entity(batch, MediaType.APPLICATION_JSON_TYPE))) {
+                    .put(Entity.json(batch))) {
 
                 assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(422);
                 assertThat(actualResponse.hasEntity()).isTrue();
@@ -2305,6 +2329,23 @@ class DatasetsResourceTest {
             getItemAndAssert(newItem, TEST_WORKSPACE, API_KEY);
         }
 
+        @Test
+        @DisplayName("when dataset item support null values for data fields, then return no content and create item")
+        void createDatasetItem__whenDatasetItemSupportNullValuesForDataFields__thenReturnNoContentAndCreateItem() {
+            var item = factory.manufacturePojo(DatasetItem.class).toBuilder()
+                    .data(Map.of("test", NullNode.getInstance()))
+                    .build();
+
+            var batch = factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
+                    .items(List.of(item))
+                    .datasetId(null)
+                    .build();
+
+            putAndAssert(batch, TEST_WORKSPACE, API_KEY);
+
+            getItemAndAssert(item, TEST_WORKSPACE, API_KEY);
+        }
+
         @ParameterizedTest
         @MethodSource("invalidDatasetItems")
         @DisplayName("when dataset item batch contains duplicate items, then return 422")
@@ -2344,9 +2385,17 @@ class DatasetsResourceTest {
                     arguments(factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
                             .items(List.of(factory.manufacturePojo(DatasetItem.class).toBuilder()
                                     .input(null)
+                                    .data(null)
                                     .build()))
                             .build(),
-                            "items[0].input must not be null"),
+                            "items[0].input must provide either input or data field"),
+                    arguments(factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
+                            .items(List.of(factory.manufacturePojo(DatasetItem.class).toBuilder()
+                                    .input(null)
+                                    .data(Map.of())
+                                    .build()))
+                            .build(),
+                            "items[0].input must provide either input or data field"),
                     arguments(factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
                             .items(List.of(factory.manufacturePojo(DatasetItem.class).toBuilder()
                                     .source(null)
@@ -2538,6 +2587,40 @@ class DatasetsResourceTest {
             }
         }
 
+        @Test
+        @DisplayName("when data is null, the accept the request")
+        void create__whenDataIsNull__thenAcceptTheRequest() {
+            var item = factory.manufacturePojo(DatasetItem.class).toBuilder()
+                    .data(null)
+                    .build();
+
+            var batch = factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
+                    .items(List.of(item))
+                    .datasetId(null)
+                    .build();
+
+            putAndAssert(batch, TEST_WORKSPACE, API_KEY);
+
+            getItemAndAssert(item, TEST_WORKSPACE, API_KEY);
+        }
+
+        @Test
+        @DisplayName("when input is null but data is present, the accept the request")
+        void create__whenInputIsNullButDataIsPresent__thenAcceptTheRequest() {
+            var item = factory.manufacturePojo(DatasetItem.class).toBuilder()
+                    .input(null)
+                    .build();
+
+            var batch = factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
+                    .items(List.of(item))
+                    .datasetId(null)
+                    .build();
+
+            putAndAssert(batch, TEST_WORKSPACE, API_KEY);
+
+            getItemAndAssert(item, TEST_WORKSPACE, API_KEY);
+        }
+
     }
 
     private UUID createTrace(Trace trace, String apiKey, String workspaceName) {
@@ -2643,9 +2726,7 @@ class DatasetsResourceTest {
 
                 List<DatasetItem> actualItems = getStreamedItems(response);
 
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(items.reversed());
+                assertPage(items.reversed(), actualItems);
             }
         }
 
@@ -2682,9 +2763,7 @@ class DatasetsResourceTest {
 
                 List<DatasetItem> actualItems = getStreamedItems(response);
 
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(items.reversed().subList(2, 5));
+                assertPage(items.reversed().subList(2, 5), actualItems);
             }
         }
 
@@ -2726,9 +2805,7 @@ class DatasetsResourceTest {
 
                 List<DatasetItem> actualItems = getStreamedItems(response);
 
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(expectedFirstPage);
+                assertPage(expectedFirstPage, actualItems);
             }
 
             streamRequest = DatasetItemStreamRequest.builder()
@@ -2749,9 +2826,7 @@ class DatasetsResourceTest {
 
                 List<DatasetItem> actualItems = getStreamedItems(response);
 
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(items.reversed().subList(500, 1000));
+                assertPage(items.reversed().subList(500, 1000), actualItems);
             }
         }
     }
@@ -2768,13 +2843,49 @@ class DatasetsResourceTest {
         var actualEntity = actualResponse.readEntity(DatasetItem.class);
         assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(200);
 
+        Map<String, JsonNode> data = Optional.ofNullable(expectedDatasetItem.data())
+                .orElse(Map.of());
+
+        expectedDatasetItem = mergeInputMap(expectedDatasetItem, data);
+
         assertThat(actualEntity.id()).isEqualTo(expectedDatasetItem.id());
         assertThat(actualEntity).usingRecursiveComparison()
-                .ignoringFields("createdAt", "lastUpdatedAt", "experimentItems", "createdBy", "lastUpdatedBy")
+                .ignoringFields(IGNORED_FIELDS_DATA_ITEM)
                 .isEqualTo(expectedDatasetItem);
 
         assertThat(actualEntity.createdAt()).isInThePast();
         assertThat(actualEntity.lastUpdatedAt()).isInThePast();
+    }
+
+    private DatasetItem mergeInputMap(DatasetItem expectedDatasetItem, Map<String, JsonNode> data) {
+
+        Map<String, JsonNode> newMap = new HashMap<>();
+
+        if (expectedDatasetItem.expectedOutput() != null) {
+            newMap.put("expected_output", expectedDatasetItem.expectedOutput());
+        }
+
+        if (expectedDatasetItem.input() != null) {
+            newMap.put("input", expectedDatasetItem.input());
+        }
+
+        if (expectedDatasetItem.metadata() != null) {
+            newMap.put("metadata", expectedDatasetItem.metadata());
+        }
+
+        Map<String, JsonNode> mergedMap = Stream
+                .concat(data.entrySet().stream(), newMap.entrySet().stream())
+                .collect(toMap(
+                        Map.Entry::getKey,
+                        Map.Entry::getValue,
+                        (v1, v2) -> v2 // In case of conflict, use the value from map2
+                ));
+
+        expectedDatasetItem = expectedDatasetItem.toBuilder()
+                .data(mergedMap)
+                .build();
+
+        return expectedDatasetItem;
     }
 
     @Nested
@@ -2891,6 +3002,13 @@ class DatasetsResourceTest {
                     .datasetId(datasetId)
                     .build();
 
+            List<Map<String, JsonNode>> data = batch.items()
+                    .stream()
+                    .map(DatasetItem::data)
+                    .toList();
+
+            Set<Column> columns = addDeprecatedFields(data);
+
             putAndAssert(batch, TEST_WORKSPACE, API_KEY);
 
             try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
@@ -2905,16 +3023,7 @@ class DatasetsResourceTest {
 
                 var actualEntity = actualResponse.readEntity(DatasetItemPage.class);
 
-                assertThat(actualEntity.size()).isEqualTo(items.size());
-                assertThat(actualEntity.content()).hasSize(items.size());
-                assertThat(actualEntity.page()).isEqualTo(1);
-                assertThat(actualEntity.total()).isEqualTo(items.size());
-
-                var actualItems = actualEntity.content();
-
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(items.reversed());
+                assertDatasetItemPage(actualEntity, items.reversed(), columns, 1);
             }
         }
 
@@ -2933,6 +3042,13 @@ class DatasetsResourceTest {
                     .datasetId(datasetId)
                     .build();
 
+            List<Map<String, JsonNode>> data = batch.items()
+                    .stream()
+                    .map(DatasetItem::data)
+                    .toList();
+
+            Set<Column> columns = addDeprecatedFields(data);
+
             putAndAssert(batch, TEST_WORKSPACE, API_KEY);
 
             try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
@@ -2945,19 +3061,11 @@ class DatasetsResourceTest {
                     .get()) {
 
                 assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(200);
-
                 var actualEntity = actualResponse.readEntity(DatasetItemPage.class);
 
-                assertThat(actualEntity.size()).isEqualTo(1);
-                assertThat(actualEntity.content()).hasSize(1);
-                assertThat(actualEntity.page()).isEqualTo(1);
-                assertThat(actualEntity.total()).isEqualTo(items.size());
+                List<DatasetItem> expectedContent = List.of(items.reversed().getFirst());
 
-                var actualItems = actualEntity.content();
-
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(List.of(items.reversed().getFirst()));
+                assertDatasetItemPage(actualEntity, expectedContent, 5, columns, 1);
             }
         }
 
@@ -2989,6 +3097,13 @@ class DatasetsResourceTest {
 
             putAndAssert(updatedBatch, TEST_WORKSPACE, API_KEY);
 
+            List<Map<String, JsonNode>> data = updatedBatch.items()
+                    .stream()
+                    .map(DatasetItem::data)
+                    .toList();
+
+            Set<Column> columns = addDeprecatedFields(data);
+
             try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
                     .path(datasetId.toString())
                     .path("items")
@@ -3001,19 +3116,107 @@ class DatasetsResourceTest {
 
                 var actualEntity = actualResponse.readEntity(DatasetItemPage.class);
 
-                assertThat(actualEntity.size()).isEqualTo(updatedItems.size());
-                assertThat(actualEntity.content()).hasSize(updatedItems.size());
-                assertThat(actualEntity.page()).isEqualTo(1);
-                assertThat(actualEntity.total()).isEqualTo(updatedItems.size());
-
-                var actualItems = actualEntity.content();
-
-                assertThat(actualItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .isEqualTo(updatedItems.reversed());
+                assertDatasetItemPage(actualEntity, updatedItems.reversed(), columns, 1);
             }
         }
 
+        @Test
+        @DisplayName("when items have data with same keys and different types, then return columns types and count")
+        void getDatasetItemsByDatasetId__whenItemsHaveDataWithSameKeysAndDifferentTypes__thenReturnColumnsTypesAndCount() {
+
+            UUID datasetId = createAndAssert(factory.manufacturePojo(Dataset.class).toBuilder()
+                    .id(null)
+                    .build());
+
+            var item = factory.manufacturePojo(DatasetItem.class);
+
+            var item2 = item.toBuilder()
+                    .id(factory.manufacturePojo(UUID.class))
+                    .data(item.data()
+                            .keySet()
+                            .stream()
+                            .map(key -> Map.entry(key, NullNode.getInstance()))
+                            .collect(toMap(Map.Entry::getKey, Map.Entry::getValue)))
+                    .build();
+
+            var item3 = item.toBuilder()
+                    .id(factory.manufacturePojo(UUID.class))
+                    .data(item.data()
+                            .keySet()
+                            .stream()
+                            .map(key -> Map.entry(key, TextNode.valueOf(RandomStringUtils.randomAlphanumeric(10))))
+                            .collect(toMap(Map.Entry::getKey, Map.Entry::getValue)))
+                    .build();
+
+            var batch = factory.manufacturePojo(DatasetItemBatch.class).toBuilder()
+                    .items(List.of(item, item2, item3))
+                    .datasetId(datasetId)
+                    .build();
+
+            List<Map<String, JsonNode>> data = batch.items()
+                    .stream()
+                    .map(DatasetItem::data)
+                    .toList();
+
+            Set<Column> columns = addDeprecatedFields(data);
+
+            putAndAssert(batch, TEST_WORKSPACE, API_KEY);
+
+            try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
+                    .path(datasetId.toString())
+                    .path("items")
+                    .request()
+                    .header(HttpHeaders.AUTHORIZATION, API_KEY)
+                    .header(WORKSPACE_HEADER, TEST_WORKSPACE)
+                    .get()) {
+
+                assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(200);
+
+                var actualEntity = actualResponse.readEntity(DatasetItemPage.class);
+
+                assertDatasetItemPage(actualEntity, batch.items().reversed(), columns, 1);
+            }
+
+        }
+    }
+
+    private void assertDatasetItemPage(DatasetItemPage actualPage, List<DatasetItem> expected, Set<Column> columns,
+            int page) {
+        assertDatasetItemPage(actualPage, expected, expected.size(), columns, page);
+    }
+
+    private void assertDatasetItemPage(DatasetItemPage actualPage, List<DatasetItem> expected, int total,
+            Set<Column> columns, int page) {
+        assertThat(actualPage.size()).isEqualTo(expected.size());
+        assertThat(actualPage.content()).hasSize(expected.size());
+        assertThat(actualPage.page()).isEqualTo(page);
+        assertThat(actualPage.total()).isEqualTo(total);
+        assertThat(actualPage.columns()).isEqualTo(columns);
+
+        assertPage(expected, actualPage.content());
+    }
+
+    private void assertPage(List<DatasetItem> expectedItems, List<DatasetItem> actualItems) {
+
+        List<String> ignoredFields = new ArrayList<>(Arrays.asList(IGNORED_FIELDS_DATA_ITEM));
+        ignoredFields.add("data");
+
+        assertThat(actualItems)
+                .usingRecursiveFieldByFieldElementComparatorIgnoringFields(ignoredFields.toArray(String[]::new))
+                .isEqualTo(expectedItems);
+
+        assertThat(actualItems).hasSize(expectedItems.size());
+        for (int i = 0; i < actualItems.size(); i++) {
+            var actualDatasetItem = actualItems.get(i);
+            var expectedDatasetItem = expectedItems.get(i);
+
+            Map<String, JsonNode> data = Optional.ofNullable(expectedDatasetItem.data())
+                    .orElse(Map.of());
+
+            expectedDatasetItem = mergeInputMap(expectedDatasetItem, data);
+
+            assertThat(actualDatasetItem.data()).isEqualTo(expectedDatasetItem.data());
+        }
     }
 
     @Nested
@@ -3056,7 +3259,7 @@ class DatasetsResourceTest {
                     .toList();
 
             var traceIdToScoresMap = Stream.concat(scores1.stream(), scores2.stream())
-                    .collect(Collectors.groupingBy(FeedbackScoreBatchItem::id));
+                    .collect(groupingBy(FeedbackScoreBatchItem::id));
 
             // When storing the scores in batch, adding some more unrelated random ones
             var feedbackScoreBatch = factory.manufacturePojo(FeedbackScoreBatch.class);
@@ -3104,7 +3307,7 @@ class DatasetsResourceTest {
                                             .map(FeedbackScoreMapper.INSTANCE::toFeedbackScore)
                                             .toList())
                                     .build()))
-                    .collect(Collectors.groupingBy(ExperimentItem::datasetItemId));
+                    .collect(groupingBy(ExperimentItem::datasetItemId));
 
             // Dataset item 2 covers the case of experiments items related to a trace without input, output and scores.
             // It also has 2 experiment items per each of the 5 experiments.
@@ -3140,9 +3343,15 @@ class DatasetsResourceTest {
             experimentItemsBatch = experimentItemsBatch.toBuilder()
                     .experimentItems(Stream.concat(experimentItemsBatch.experimentItems().stream(),
                             datasetItemIdToExperimentItemMap.values().stream().flatMap(Collection::stream))
-                            .collect(Collectors.toUnmodifiableSet()))
+                            .collect(toUnmodifiableSet()))
                     .build();
             createAndAssert(experimentItemsBatch, apiKey, workspaceName);
+
+            List<Map<String, JsonNode>> data = expectedDatasetItems.stream()
+                    .map(DatasetItem::data)
+                    .toList();
+
+            Set<Column> columns = addDeprecatedFields(data);
 
             var page = 1;
             var pageSize = 5;
@@ -3167,12 +3376,11 @@ class DatasetsResourceTest {
                 assertThat(actualPage.page()).isEqualTo(page);
                 assertThat(actualPage.size()).isEqualTo(expectedDatasetItems.size());
                 assertThat(actualPage.total()).isEqualTo(expectedDatasetItems.size());
+                assertThat(actualPage.columns()).isEqualTo(columns);
 
                 var actualDatasetItems = actualPage.content();
 
-                assertThat(actualDatasetItems)
-                        .usingRecursiveFieldByFieldElementComparatorIgnoringFields(IGNORED_FIELDS_DATA_ITEM)
-                        .containsExactlyElementsOf(expectedDatasetItems);
+                assertPage(expectedDatasetItems, actualPage.content());
 
                 for (var i = 0; i < actualDatasetItems.size(); i++) {
                     var actualDatasetItem = actualDatasetItems.get(i);
@@ -3240,6 +3448,412 @@ class DatasetsResourceTest {
                 assertThat(actualErrorMessage).isEqualTo(expectedErrorMessage);
             }
         }
+
+        @ParameterizedTest
+        @MethodSource
+        void find__whenFilteringBySupportedFields__thenReturnMatchingRows(Filter filter) {
+            var workspaceName = UUID.randomUUID().toString();
+            var apiKey = UUID.randomUUID().toString();
+            var workspaceId = UUID.randomUUID().toString();
+
+            mockTargetWorkspace(apiKey, workspaceName, workspaceId);
+
+            var dataset = factory.manufacturePojo(Dataset.class);
+            var datasetId = createAndAssert(dataset, apiKey, workspaceName);
+
+            List<DatasetItem> items = new ArrayList<>();
+            createDatasetItems(items);
+            var batch = DatasetItemBatch.builder()
+                    .items(items)
+                    .datasetId(datasetId)
+                    .build();
+            putAndAssert(batch, workspaceName, apiKey);
+
+            String projectName = RandomStringUtils.randomAlphanumeric(20);
+            List<Trace> traces = new ArrayList<>();
+            createTraces(items, projectName, workspaceName, apiKey, traces);
+
+            UUID experimentId = GENERATOR.generate();
+
+            List<FeedbackScoreBatchItem> scores = new ArrayList<>();
+            createScores(traces, projectName, scores);
+            createScoreAndAssert(new FeedbackScoreBatch(scores), apiKey, workspaceName);
+
+            List<ExperimentItem> experimentItems = new ArrayList<>();
+            createExperimentItems(items, traces, scores, experimentId, experimentItems);
+
+            createAndAssert(
+                    ExperimentItemsBatch.builder()
+                            .experimentItems(Set.copyOf(experimentItems))
+                            .build(),
+                    apiKey,
+                    workspaceName);
+
+            Set<Column> columns = addDeprecatedFields(List.of(items.getFirst().data()));
+
+            List<Filter> filters = List.of(filter);
+
+            try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
+                    .path(datasetId.toString())
+                    .path(DATASET_ITEMS_WITH_EXPERIMENT_ITEMS_PATH)
+                    .queryParam("experiment_ids", JsonUtils.writeValueAsString(List.of(experimentId)))
+                    .queryParam("filters", toURLEncodedQueryParam(filters))
+                    .request()
+                    .header(HttpHeaders.AUTHORIZATION, apiKey)
+                    .header(WORKSPACE_HEADER, workspaceName)
+                    .get()) {
+
+                assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(200);
+                assertThat(actualResponse.hasEntity()).isTrue();
+
+                var actualPage = actualResponse.readEntity(DatasetItemPage.class);
+
+                assertDatasetItemPage(actualPage, List.of(items.getFirst()), columns, 1);
+
+                assertDatasetItemExperiments(actualPage, items, experimentItems);
+            }
+        }
+
+        Stream<Arguments> find__whenFilteringBySupportedFields__thenReturnMatchingRows() {
+            return Stream.of(
+                    arguments(new ExperimentsComparisonFilter(ExperimentsComparisonField.FEEDBACK_SCORES,
+                            Operator.EQUAL, "sql_cost", "10")),
+                    arguments(new ExperimentsComparisonFilter(ExperimentsComparisonField.INPUT, Operator.CONTAINS, null,
+                            "sql_cost")),
+                    arguments(new ExperimentsComparisonFilter(ExperimentsComparisonField.OUTPUT, Operator.CONTAINS,
+                            null, "sql_cost")),
+                    arguments(new ExperimentsComparisonFilter(ExperimentsComparisonField.EXPECTED_OUTPUT,
+                            Operator.CONTAINS, null, "sql_cost")),
+                    arguments(new ExperimentsComparisonFilter(ExperimentsComparisonField.METADATA, Operator.EQUAL,
+                            "sql_cost", "10")));
+        }
+
+        private void createExperimentItems(List<DatasetItem> items, List<Trace> traces,
+                List<FeedbackScoreBatchItem> scores, UUID experimentId, List<ExperimentItem> experimentItems) {
+            for (int i = 0; i < items.size(); i++) {
+                var item = items.get(i);
+                var trace = traces.get(i);
+                var score = scores.get(i);
+
+                var experimentItem = ExperimentItem.builder()
+                        .id(GENERATOR.generate())
+                        .datasetItemId(item.id())
+                        .traceId(trace.id())
+                        .experimentId(experimentId)
+                        .input(trace.input())
+                        .output(trace.output())
+                        .feedbackScores(Stream.of(score)
+                                .map(FeedbackScoreMapper.INSTANCE::toFeedbackScore)
+                                .toList())
+                        .build();
+
+                experimentItems.add(experimentItem);
+            }
+        }
+
+        private void createScores(List<Trace> traces, String projectName, List<FeedbackScoreBatchItem> scores) {
+            for (int i = 0; i < traces.size(); i++) {
+                var trace = traces.get(i);
+
+                var score = FeedbackScoreBatchItem.builder()
+                        .name("sql_cost")
+                        .value(BigDecimal.valueOf(i == 0 ? 10 : i))
+                        .source(ScoreSource.SDK)
+                        .id(trace.id())
+                        .projectName(projectName)
+                        .build();
+
+                scores.add(score);
+            }
+        }
+
+        private void createTraces(List<DatasetItem> items, String projectName, String workspaceName, String apiKey,
+                List<Trace> traces) {
+            for (int i = 0; i < items.size(); i++) {
+                var item = items.get(i);
+                var trace = Trace.builder()
+                        .id(GENERATOR.generate())
+                        .input(item.input())
+                        .output(item.expectedOutput())
+                        .projectName(projectName)
+                        .startTime(Instant.now())
+                        .name("trace-" + i)
+                        .build();
+
+                createAndAssert(trace, workspaceName, apiKey);
+                traces.add(trace);
+            }
+        }
+
+        private void createDatasetItems(List<DatasetItem> items) {
+            for (int i = 0; i < 5; i++) {
+                if (i == 0) {
+                    DatasetItem item = factory.manufacturePojo(DatasetItem.class)
+                            .toBuilder()
+                            .input(JsonUtils
+                                    .getJsonNodeFromString(JsonUtils.writeValueAsString(Map.of("input", "sql_cost"))))
+                            .expectedOutput(JsonUtils
+                                    .getJsonNodeFromString(JsonUtils.writeValueAsString(Map.of("output", "sql_cost"))))
+                            .metadata(JsonUtils
+                                    .getJsonNodeFromString(JsonUtils.writeValueAsString(Map.of("sql_cost", 10))))
+                            .source(DatasetItemSource.SDK)
+                            .traceId(null)
+                            .spanId(null)
+                            .build();
+
+                    items.add(item);
+                } else {
+                    var item = factory.manufacturePojo(DatasetItem.class);
+
+                    items.add(item);
+                }
+            }
+        }
+
+        private void createScoreAndAssert(FeedbackScoreBatch feedbackScoreBatch, String apiKey, String workspaceName) {
+            try (var actualResponse = client.target(getTracesPath())
+                    .path("feedback-scores")
+                    .request()
+                    .header(HttpHeaders.AUTHORIZATION, apiKey)
+                    .header(WORKSPACE_HEADER, workspaceName)
+                    .put(Entity.json(feedbackScoreBatch))) {
+
+                assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(204);
+                assertThat(actualResponse.hasEntity()).isFalse();
+            }
+        }
+
+        private String toURLEncodedQueryParam(List<? extends Filter> filters) {
+            return CollectionUtils.isEmpty(filters)
+                    ? null
+                    : URLEncoder.encode(JsonUtils.writeValueAsString(filters), StandardCharsets.UTF_8);
+        }
+
+        @ParameterizedTest
+        @MethodSource
+        void find__whenFilterInvalidOperatorForFieldType__thenReturn400(ExperimentsComparisonFilter filter) {
+            var workspaceName = UUID.randomUUID().toString();
+            var apiKey = UUID.randomUUID().toString();
+            var workspaceId = UUID.randomUUID().toString();
+
+            mockTargetWorkspace(apiKey, workspaceName, workspaceId);
+
+            var expectedError = new io.dropwizard.jersey.errors.ErrorMessage(
+                    400,
+                    "Invalid operator '%s' for field '%s' of type '%s'".formatted(
+                            filter.operator().getQueryParamOperator(),
+                            filter.field().getQueryParamField(),
+                            filter.field().getType()));
+
+            var datasetId = GENERATOR.generate();
+            var experimentId = GENERATOR.generate();
+            var filters = List.of(filter);
+
+            try (var actualResponse = client.target(BASE_RESOURCE_URI.formatted(baseURI))
+                    .path(datasetId.toString())
+                    .path(DATASET_ITEMS_WITH_EXPERIMENT_ITEMS_PATH)
+                    .queryParam("experiment_ids", JsonUtils.writeValueAsString(List.of(experimentId)))
+                    .queryParam("filters", toURLEncodedQueryParam(filters))
+                    .request()
+                    .header(HttpHeaders.AUTHORIZATION, apiKey)
+                    .header(WORKSPACE_HEADER, workspaceName)
+                    .get()) {
+
+                assertThat(actualResponse.getStatusInfo().getStatusCode()).isEqualTo(400);
+                assertThat(actualResponse.hasEntity()).isTrue();
+
+                var actualError = actualResponse.readEntity(io.dropwizard.jersey.errors.ErrorMessage.class);
+                assertThat(actualError).isEqualTo(expectedError);
+            }
+
+        }
+
+        static Stream<Arguments> find__whenFilterInvalidOperatorForFieldType__thenReturn400() {
+            return Stream.of(
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.FEEDBACK_SCORES)
+                            .operator(Operator.CONTAINS)
+                            .value(RandomStringUtils.randomAlphanumeric(10))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.FEEDBACK_SCORES)
+                            .operator(Operator.NOT_CONTAINS)
+                            .value(RandomStringUtils.randomAlphanumeric(10))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.FEEDBACK_SCORES)
+                            .operator(Operator.STARTS_WITH)
+                            .value(RandomStringUtils.randomAlphanumeric(10))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.FEEDBACK_SCORES)
+                            .operator(Operator.ENDS_WITH)
+                            .value(RandomStringUtils.randomAlphanumeric(10))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.INPUT)
+                            .operator(Operator.GREATER_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.INPUT)
+                            .operator(Operator.LESS_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.INPUT)
+                            .operator(Operator.GREATER_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.INPUT)
+                            .operator(Operator.LESS_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.OUTPUT)
+                            .operator(Operator.GREATER_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.OUTPUT)
+                            .operator(Operator.LESS_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.OUTPUT)
+                            .operator(Operator.GREATER_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.OUTPUT)
+                            .operator(Operator.LESS_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.EXPECTED_OUTPUT)
+                            .operator(Operator.GREATER_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.EXPECTED_OUTPUT)
+                            .operator(Operator.LESS_THAN)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.EXPECTED_OUTPUT)
+                            .operator(Operator.GREATER_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()),
+                    Arguments.of(ExperimentsComparisonFilter.builder()
+                            .field(ExperimentsComparisonField.EXPECTED_OUTPUT)
+                            .operator(Operator.LESS_THAN_EQUAL)
+                            .value(RandomStringUtils.randomNumeric(3))
+                            .build()));
+        }
+    }
+
+    @Nested
+    @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+    //TODO: Remove this test class after migration to the new dataset item format
+    class TestNoMigratedDatasetItemRetrieval {
+
+        private DatasetItem datasetItem;
+
+        @BeforeEach
+        void setUp() {
+
+            var datasetId = createAndAssert(factory.manufacturePojo(Dataset.class));
+            var clickhouseConnectionFactory = ClickHouseContainerUtils.newDatabaseAnalyticsFactory(
+                    CLICKHOUSE, DATABASE_NAME).build();
+
+            var datasetItem = factory.manufacturePojo(DatasetItem.class);
+
+            Mono.from(clickhouseConnectionFactory.create())
+                    .flatMap(connection -> Mono.from(connection.createStatement("""
+                            INSERT INTO %s.%s (
+                            id,
+                            input,
+                            expected_output,
+                            metadata,
+                            source,
+                            dataset_id,
+                            workspace_id
+                            ) VALUES (:id, :input, :expected_output, :metadata, :source, :dataset_id, :workspace_id)
+                            """.formatted(DATABASE_NAME, "dataset_items"))
+                            .bind("id", datasetItem.id())
+                            .bind("input", datasetItem.input().toString())
+                            .bind("expected_output", datasetItem.expectedOutput().toString())
+                            .bind("metadata", datasetItem.metadata().toString())
+                            .bind("source", DatasetItemSource.SDK.getValue())
+                            .bind("dataset_id", datasetId)
+                            .bind("workspace_id", WORKSPACE_ID)
+                            .execute()))
+                    .block();
+
+            this.datasetItem = datasetItem;
+        }
+
+        @Test
+        void findById__whenDatasetItemNotMigrated__thenReturnDatasetItemWithData() {
+
+            var item = datasetItem.toBuilder()
+                    .spanId(null)
+                    .traceId(null)
+                    .experimentItems(null)
+                    .source(DatasetItemSource.SDK)
+                    .data(Map.of("input", datasetItem.input(),
+                            "expected_output", datasetItem.expectedOutput(),
+                            "metadata", datasetItem.metadata()))
+                    .build();
+
+            getItemAndAssert(item, TEST_WORKSPACE, API_KEY);
+        }
+    }
+
+    private Set<Column> addDeprecatedFields(List<Map<String, JsonNode>> data) {
+
+        HashSet<Column> columns = data
+                .stream()
+                .map(Map::entrySet)
+                .flatMap(Collection::stream)
+                .map(entry -> new Column(
+                        entry.getKey(),
+                        Set.of(StringUtils.capitalize(entry.getValue().getNodeType().name().toLowerCase()))))
+                .collect(Collectors.toCollection(HashSet::new));
+
+        columns.add(new Column("input", Set.of("Object")));
+        columns.add(new Column("expected_output", Set.of("Object")));
+        columns.add(new Column("metadata", Set.of("Object")));
+
+        Map<String, Set<String>> results = columns.stream()
+                .collect(groupingBy(Column::name, mapping(Column::types, flatMapping(Set::stream, toSet()))));
+
+        return results.entrySet()
+                .stream()
+                .map(entry -> new Column(entry.getKey(), entry.getValue()))
+                .collect(Collectors.toSet());
+    }
+
+    private void assertDatasetItemExperiments(DatasetItemPage actualPage, List<DatasetItem> items,
+            List<ExperimentItem> experimentItems) {
+
+        assertPage(List.of(items.getFirst()), List.of(actualPage.content().getFirst()));
+
+        var actualExperimentItems = actualPage.content().getFirst().experimentItems();
+        assertThat(actualExperimentItems).hasSize(1);
+        assertThat(actualExperimentItems.getFirst())
+                .usingRecursiveComparison()
+                .ignoringFields(IGNORED_FIELDS_LIST)
+                .isEqualTo(experimentItems.getFirst());
+
+        var actualFeedbackScores = actualExperimentItems.getFirst().feedbackScores();
+        assertThat(actualFeedbackScores).hasSize(1);
+
+        assertThat(actualFeedbackScores.getFirst())
+                .usingRecursiveComparison()
+                .withComparatorForType(BigDecimal::compareTo, BigDecimal.class)
+                .isEqualTo(experimentItems.getFirst().feedbackScores().getFirst());
     }
 
     private void putAndAssert(DatasetItemBatch batch, String workspaceName, String apiKey) {
