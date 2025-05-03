@@ -206,6 +206,7 @@ class TracesClient:
         filters: typing.Optional[str] = None,
         truncate: typing.Optional[bool] = None,
         sorting: typing.Optional[str] = None,
+        exclude: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TracePagePublic:
         """
@@ -226,6 +227,8 @@ class TracesClient:
         truncate : typing.Optional[bool]
 
         sorting : typing.Optional[str]
+
+        exclude : typing.Optional[str]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -256,6 +259,7 @@ class TracesClient:
                 "filters": filters,
                 "truncate": truncate,
                 "sorting": sorting,
+                "exclude": exclude,
             },
             request_options=request_options,
         )
@@ -1586,6 +1590,7 @@ class AsyncTracesClient:
         filters: typing.Optional[str] = None,
         truncate: typing.Optional[bool] = None,
         sorting: typing.Optional[str] = None,
+        exclude: typing.Optional[str] = None,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> TracePagePublic:
         """
@@ -1606,6 +1611,8 @@ class AsyncTracesClient:
         truncate : typing.Optional[bool]
 
         sorting : typing.Optional[str]
+
+        exclude : typing.Optional[str]
 
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
@@ -1644,6 +1651,7 @@ class AsyncTracesClient:
                 "filters": filters,
                 "truncate": truncate,
                 "sorting": sorting,
+                "exclude": exclude,
             },
             request_options=request_options,
         )
